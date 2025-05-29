@@ -43,8 +43,7 @@ with lib; let
     if isDarwin
     then "admin"
     else "keys";
-  # chown the secrets mountpoint and the current generation to the keys group
-  # instead of leaving it root:root.
+
   chownMountPoint = ''
     chown :${chownGroup} "${cfg.secretsMountPoint}" "${cfg.secretsMountPoint}/$_agenix_generation"
   '';
@@ -66,23 +65,63 @@ with lib; let
     echo "decrypting '${secretType.file}' to '$_truePath'..."
     TMP_FILE="$_truePath.tmp"
 
+    # Check for YubiKey presence
+    yubikey_missing=true
+    ${pkgs.yubikey-personalization}/bin/ykinfo -v 1>/dev/null 2>&1
+    if [ $? != "0" ]; then
+        echo -n "waiting 10 seconds for YubiKey to appear..."
+        for try in $(seq 10); do
+            sleep 1
+            ${pkgs.yubikey-personalization}/bin/ykinfo -v 1>/dev/null 2>&1
+            if [ $? == "0" ]; then
+                yubikey_missing=false
+                break
+            fi
+            echo -n .
+        done
+        echo "ok"
+    else
+        yubikey_missing=false
+    fi
+
+    if [ "$yubikey_missing" == true ]; then
+        echo "no YubiKey found, attempting decryption with available identities..."
+    else
+        echo "YubiKey detected, proceeding with decryption..."
+    fi
+
     IDENTITIES=()
     for identity in ${toString cfg.identityPaths}; do
-      test -r "$identity" || continue
-      test -s "$identity" || continue
+      test -r "$identity" || { echo "[agenix] WARNING: identity file $identity not readable"; continue; }
+      test -s "$identity" || { echo "[agenix] WARNING: identity file $identity is empty"; continue; }
       IDENTITIES+=(-i)
       IDENTITIES+=("$identity")
     done
-
-    test "''${#IDENTITIES[@]}" -eq 0 && echo "[agenix] WARNING: no readable identities found!"
 
     mkdir -p "$(dirname "$_truePath")"
     [ "${secretType.path}" != "${cfg.secretsDir}/${secretType.name}" ] && mkdir -p "$(dirname "${secretType.path}")"
     (
       umask u=r,g=,o=
-      test -f "${secretType.file}" || echo '[agenix] WARNING: encrypted file ${secretType.file} does not exist!'
-      test -d "$(dirname "$TMP_FILE")" || echo "[agenix] WARNING: $(dirname "$TMP_FILE") does not exist!"
-      LANG=${config.i18n.defaultLocale or "C"} ${ageBin} --decrypt "''${IDENTITIES[@]}" -o "$TMP_FILE" "${secretType.file}"
+      test -f "${secretType.file}" || { echo '[agenix] ERROR: encrypted file ${secretType.file} does not exist!'; exit 1; }
+      test -d "$(dirname "$TMP_FILE")" || { echo "[agenix] ERROR: directory $(dirname "$TMP_FILE") does not exist!"; exit 1; }
+      # Retry decryption up to 3 times to handle potential YubiKey access issues
+      for attempt in $(seq 3); do
+        echo "[agenix] Attempting decryption (attempt $attempt of 3)..."
+        if LANG=${config.i18n.defaultLocale or "C"} ${ageBin} --decrypt "''${IDENTITIES[@]}" -o "$TMP_FILE" "${secretType.file}" 2> decryption_error.log; then
+          break
+        else
+          echo "[agenix] WARNING: decryption attempt $attempt failed: $(cat decryption_error.log)"
+          if [ $attempt -lt 3 ]; then
+            echo "Retrying in 2 seconds..."
+            sleep 2
+          else
+            echo "[agenix] ERROR: decryption failed after 3 attempts, check YubiKey configuration or other identities"
+            cat decryption_error.log
+            exit 1
+          fi
+        fi
+      done
+      rm -f decryption_error.log
     )
     chmod ${secretType.mode} "$TMP_FILE"
     mv -f "$TMP_FILE" "$_truePath"
@@ -96,8 +135,7 @@ with lib; let
     map
     (path: ''
       test -f ${path} || echo '[agenix] WARNING: config.age.identityPaths entry ${path} not present!'
-    '')
-    cfg.identityPaths;
+    '') cfg.identityPaths;
 
   cleanupAndLink = ''
     _agenix_generation="$(basename "$(readlink ${cfg.secretsDir})" || echo 0)"
@@ -128,193 +166,128 @@ with lib; let
     ++ [chownMountPoint]
     ++ (map chownSecret (builtins.attrValues cfg.secrets))
   );
-
-  secretType = types.submodule ({config, ...}: {
-    options = {
-      name = mkOption {
-        type = types.str;
-        default = config._module.args.name;
-        defaultText = literalExpression "config._module.args.name";
-        description = ''
-          Name of the file used in {option}`age.secretsDir`
-        '';
-      };
-      file = mkOption {
-        type = types.path;
-        description = ''
-          Age file the secret is loaded from.
-        '';
-      };
-      path = mkOption {
-        type = types.str;
-        default = "${cfg.secretsDir}/${config.name}";
-        defaultText = literalExpression ''
-          "''${cfg.secretsDir}/''${config.name}"
-        '';
-        description = ''
-          Path where the decrypted secret is installed.
-        '';
-      };
-      mode = mkOption {
-        type = types.str;
-        default = "0400";
-        description = ''
-          Permissions mode of the decrypted secret in a format understood by chmod.
-        '';
-      };
-      owner = mkOption {
-        type = types.str;
-        default = "0";
-        description = ''
-          User of the decrypted secret.
-        '';
-      };
-      group = mkOption {
-        type = types.str;
-        default = users.${config.owner}.group or "0";
-        defaultText = literalExpression ''
-          users.''${config.owner}.group or "0"
-        '';
-        description = ''
-          Group of the decrypted secret.
-        '';
-      };
-      symlink = mkEnableOption "symlinking secrets to their destination" // {default = true;};
-    };
-  });
-in {
-  imports = [
-    (mkRenamedOptionModule ["age" "sshKeyPaths"] ["age" "identityPaths"])
-  ];
-
+in
+{
   options.age = {
-    ageBin = mkOption {
-      type = types.str;
-      default = "${pkgs.age}/bin/age";
-      defaultText = literalExpression ''
-        "''${pkgs.age}/bin/age"
-      '';
-      description = ''
-        The age executable to use.
-      '';
-    };
     secrets = mkOption {
-      type = types.attrsOf secretType;
       default = {};
+      type = with types; attrsOf (submodule ({name, ...}: {
+        options = {
+          name = mkOption {
+            type = types.str;
+            default = name;
+            description = ''
+              Name of the file used in ${cfg.secretsDir}
+            '';
+          };
+          file = mkOption {
+            type = types.path;
+            description = ''
+              Age-encrypted file to decrypt.
+            '';
+          };
+          path = mkOption {
+            type = types.str;
+            default = "${cfg.secretsDir}/${name}";
+            description = ''
+              Where to decrypt the file to.
+              Warning: this file may be world-readable for a short amount of time before the chmod and chown happen!
+            '';
+          };
+          mode = mkOption {
+            type = types.str;
+            default = "0400";
+            description = ''
+              Permissions mode of the decrypted file in octal.
+            '';
+          };
+          owner = mkOption {
+            type = types.str;
+            default = "root";
+            description = ''
+              User of the file, defaults to root if not specified.
+              If the system is not running yet, this should be the name of the user, not the uid.
+            '';
+          };
+          group = mkOption {
+            type = types.str;
+            default = if isDarwin then "admin" else "root";
+            description = ''
+              Group of the file.
+              If the system is not running yet, this should be the name of the group, not the gid.
+            '';
+          };
+          symlink = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Whether to create a symlink at ${cfg.secretsDir}/${name} to the decrypted file.
+            '';
+          };
+        };
+      }));
       description = ''
-        Attrset of secrets.
+        Secrets to decrypt.
       '';
     };
     secretsDir = mkOption {
-      type = types.path;
-      default = "/run/agenix";
+      type = types.str;
+      default = if isDarwin then "/private/var/lib/agenix" else "/run/agenix";
       description = ''
-        Folder where secrets are symlinked to
+        Where to create generation symlink to decrypted secrets.
       '';
     };
     secretsMountPoint = mkOption {
-      type =
-        types.addCheck types.str
-        (s:
-          (builtins.match "[ \t\n]*" s)
-          == null # non-empty
-          && (builtins.match ".+/" s) == null) # without trailing slash
-        // {description = "${types.str.description} (with check: non-empty without trailing slash)";};
-      default = "/run/agenix.d";
+      type = types.str;
+      default = if isDarwin then "/Volumes/agenix" else "/run/agenix.d";
       description = ''
-        Where secrets are created before they are symlinked to {option}`age.secretsDir`
+        Where to mount the ramfs and put the decrypted secrets before moving them to secretsDir.
       '';
     };
     identityPaths = mkOption {
-      type = types.listOf types.path;
-      default =
-        if isDarwin
-        then [
-          "/etc/ssh/ssh_host_ed25519_key"
-          "/etc/ssh/ssh_host_rsa_key"
-        ]
-        else if (config.services.openssh.enable or false)
-        then map (e: e.path) (lib.filter (e: e.type == "rsa" || e.type == "ed25519") config.services.openssh.hostKeys)
-        else [];
-      defaultText = literalExpression ''
-        if isDarwin
-        then [
-          "/etc/ssh/ssh_host_ed25519_key"
-          "/etc/ssh/ssh_host_rsa_key"
-        ]
-        else if (config.services.openssh.enable or false)
-        then map (e: e.path) (lib.filter (e: e.type == "rsa" || e.type == "ed25519") config.services.openssh.hostKeys)
-        else [];
-      '';
+      default = [];
+      type = with types; listOf path;
       description = ''
-        Path to SSH keys to be used as identities in age decryption.
+        Paths to SSH private key files used as identities during decryption.
+      '';
+    };
+    ageBin = mkOption {
+      type = types.str;
+      default = "${pkgs.rage}/bin/rage";
+      description = ''
+        Path to age/rage binary.
       '';
     };
   };
 
-  config = mkIf (cfg.secrets != {}) (mkMerge [
-    {
-      assertions = [
-        {
-          assertion = cfg.identityPaths != [];
-          message = "age.identityPaths must be set.";
-        }
-      ];
-    }
-
-    (optionalAttrs (!isDarwin) {
-      # Create a new directory full of secrets for symlinking (this helps
-      # ensure removed secrets are actually removed, or at least become
-      # invalid symlinks).
-      system.activationScripts.agenixNewGeneration = {
-        text = newGeneration;
-        deps = [
-          "specialfs"
-        ];
-      };
-
-      system.activationScripts.agenixInstall = {
-        text = installSecrets;
-        deps = [
-          "agenixNewGeneration"
-          "specialfs"
-        ];
-      };
-
-      # So user passwords can be encrypted.
-      system.activationScripts.users.deps = ["agenixInstall"];
-
-      # Change ownership and group after users and groups are made.
-      system.activationScripts.agenixChown = {
-        text = chownSecrets;
-        deps = [
-          "users"
-          "groups"
-        ];
-      };
-
-      # So other activation scripts can depend on agenix being done.
-      system.activationScripts.agenix = {
-        text = "";
-        deps = ["agenixChown"];
-      };
-    })
-    (optionalAttrs isDarwin {
-      launchd.daemons.activate-agenix = {
-        script = ''
-          set -e
-          set -o pipefail
-          export PATH="${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:@out@/sw/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-          ${newGeneration}
-          ${installSecrets}
-          ${chownSecrets}
-          exit 0
+  config = {
+    assertions = [
+      {
+        assertion = isDarwin || (builtins.length cfg.identityPaths > 0);
+        message = ''
+          You must set `age.identityPaths` to at least one SSH private key that can be used for decryption.
         '';
-        serviceConfig = {
-          RunAtLoad = true;
-          KeepAlive.SuccessfulExit = false;
-        };
-      };
-    })
-  ]);
+      }
+    ] ++ (flip map (builtins.attrValues cfg.secrets) (secretType: {
+      assertion = (builtins.stringLength secretType.owner) > 0 -> (builtins.hasAttr secretType.owner users);
+      message = ''
+        The user ${secretType.owner} for secret ${secretType.name} does not exist!
+        If you are running this from a system that is not yet booted, you probably want to use the name of the user, not the uid.
+      '';
+    }));
+
+    environment.etc = let
+      secrets = filterAttrs (n: v: !v.symlink) cfg.secrets;
+    in
+      mapAttrs' (n: v: nameValuePair "agenix/${n}" {source = v.path; inherit (v) mode owner group;}) secrets;
+
+    system.activationScripts.agenix = {
+      text = ''
+        ${newGeneration}
+        ${installSecrets}
+        ${chownSecrets}
+      '';
+      deps = if isDarwin then [] else ["users" "groups"];
+    };
+  };
 }
